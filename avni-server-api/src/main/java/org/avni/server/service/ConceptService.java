@@ -2,7 +2,6 @@ package org.avni.server.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.validation.constraints.NotNull;
 import org.avni.server.application.FormElement;
 import org.avni.server.application.KeyType;
 import org.avni.server.application.KeyValues;
@@ -71,11 +70,26 @@ public class ConceptService implements NonScopeAwareService {
         return jsonMap;
     }
 
-    private Concept fetchOrCreateConcept(String uuid, String name) {
-        Concept concept = conceptRepository.findByUuid(uuid);
-        if (concept == null && StringUtils.hasText(name)) {
-            concept = conceptRepository.findByName(name.trim());
+    private Concept fetchOrCreateConcept(ConceptContract conceptRequest, boolean ignoreAnswerConceptUUIDAbsence) {
+        if (conceptRequest == null) {
+            throw new BadRequestError("Concept request cannot be null");
         }
+        conceptRequest.validate();
+        assertNotDuplicate(conceptRequest);
+        String uuid = conceptRequest.getUuid();
+        String name = conceptRequest.getName();
+        Concept concept = conceptRepository.findByUuid(uuid);
+
+        if (concept == null && StringUtils.hasText(name)) {
+            Concept existingConceptWithSameName = conceptRepository.findByName(name.trim());
+            if (existingConceptWithSameName != null &&
+                    (ignoreAnswerConceptUUIDAbsence ? StringUtils.hasText(uuid) : !existingConceptWithSameName.getUuid().equals(uuid))) {
+                throw new BadRequestError(String.format("Concept with name '%s' already exists with different UUID: %s",
+                        name.trim(), existingConceptWithSameName.getUuid()));
+            }
+            concept = existingConceptWithSameName;
+        }
+
         if (concept == null) {
             concept = createConcept(uuid);
         }
@@ -85,6 +99,7 @@ public class ConceptService implements NonScopeAwareService {
     private Concept createConcept(String uuid) {
         Concept concept = new Concept();
         concept.assignUUID(uuid);
+        concept.setActive(true);
         return concept;
     }
 
@@ -101,11 +116,11 @@ public class ConceptService implements NonScopeAwareService {
         }
         Concept answerConcept = conceptRepository.findByUuidOrName(answerConceptRequest.getUuid(), answerConceptRequest.getName());
         conceptAnswer.setAnswerConcept(answerConcept);
-        conceptAnswer.setVoided(answerConceptRequest.isVoided());
         Double providedOrder = answerConceptRequest.getOrder();
         conceptAnswer.setOrder(providedOrder == null ? answerOrder : providedOrder);
         conceptAnswer.setAbnormal(answerConceptRequest.isAbnormal());
         conceptAnswer.setUnique(answerConceptRequest.isUnique());
+        conceptAnswer.setVoided(answerConceptRequest.isVoided());
         return conceptAnswer;
     }
 
@@ -123,6 +138,9 @@ public class ConceptService implements NonScopeAwareService {
         List<ConceptAnswer> existingAnswersList = new ArrayList<>(existingAnswers);
         existingAnswersList.forEach(existingAnswer -> {
             if (!conceptAnswers.contains(existingAnswer)) {
+                ConceptAnswer removedAnswer = getAnswer(concept.getUuid(), existingAnswer.getAnswerConcept().getUuid());
+                removedAnswer.setVoided(true);
+                conceptAnswerRepository.save(removedAnswer);
                 concept.removeAnswer(existingAnswer);
             }
         });
@@ -136,58 +154,11 @@ public class ConceptService implements NonScopeAwareService {
         concept.setUnit(conceptRequest.getUnit());
     }
 
-    private String getImpliedDataType(ConceptContract conceptContract, Concept concept) {
+    private String getDataType(ConceptContract conceptContract, Concept concept) {
         if (conceptContract.getDataType() == null) {
             return concept.isNew() ? ConceptDataType.NA.toString() : concept.getDataType();
         }
         return conceptContract.getDataType();
-    }
-
-    private Concept map(@NotNull ConceptContract conceptRequest, boolean isAnswer) {
-        Concept concept = fetchOrCreateConcept(conceptRequest.getUuid(), conceptRequest.getName());
-        if (!concept.isNew() && isAnswer) {
-            // If the concept already exists, and we've been asked tp skip updating it, return the existing concept
-            return concept;
-        }
-
-        String impliedDataType = getImpliedDataType(conceptRequest, concept);
-        concept.setName(conceptRequest.getName());
-        concept.setDataType(impliedDataType);
-        concept.setVoided(conceptRequest.isVoided());
-        concept.setActive(conceptRequest.getActive());
-        concept.setKeyValues(conceptRequest.getKeyValues());
-        if (StringUtils.hasText(conceptRequest.getMediaUrl())) {
-            concept.setMediaType(Concept.MediaType.Image);
-            concept.setMediaUrl(conceptRequest.getMediaUrl());
-        } else {
-            concept.setMediaType(null);
-            concept.setMediaUrl(null);
-        }
-
-        concept.updateAudit();
-        switch (ConceptDataType.valueOf(impliedDataType)) {
-            case Coded:
-                if (!isAnswer)
-                    createCodedConcept(concept, conceptRequest);
-                break;
-            case Numeric:
-                setRangeValues(concept, conceptRequest);
-                break;
-        }
-        return concept;
-    }
-
-    public Concept saveOrUpdate(ConceptContract conceptRequest, boolean isAnswer) {
-        if (conceptRequest == null) return null;
-        if (StringUtils.hasText(conceptRequest.getName()) && StringUtils.hasText(conceptRequest.getUuid()) && conceptExistsWithSameNameAndDifferentUUID(conceptRequest)) {
-            throw new BadRequestError(String.format("Concept with name \'%s\' already exists", conceptRequest.getName()));
-        }
-        logger.info(String.format("Creating concept: %s", conceptRequest));
-
-        Concept concept = map(conceptRequest, isAnswer);
-        concept = conceptRepository.save(concept);
-        addToMigrationIfRequired(conceptRequest);
-        return concept;
     }
 
     private void addToMigrationIfRequired(ConceptContract conceptRequest) {
@@ -207,32 +178,77 @@ public class ConceptService implements NonScopeAwareService {
         }
     }
 
-    public List<String> saveOrUpdateConcepts(List<ConceptContract> conceptRequests) {
-        List<ConceptContract> answerConcepts = getAnswerConcepts(conceptRequests);
-
-        List<String> savedAnswerConceptUuids = new ArrayList<>();
-        for (ConceptContract codedAnswerConcept : answerConcepts) {
-            Concept concept = saveOrUpdate(codedAnswerConcept, true);
-            savedAnswerConceptUuids.add(concept.getUuid());
-        }
-
-        List<String> savedConceptUuids = new ArrayList<>();
-        for (ConceptContract conceptRequest : conceptRequests) {
-            Concept concept = saveOrUpdate(conceptRequest, false);
-            savedConceptUuids.add(concept.getUuid());
-        }
-        savedConceptUuids.addAll(savedAnswerConceptUuids);
-        return savedConceptUuids;
-    }
-
-    private static List<ConceptContract> getAnswerConcepts(List<ConceptContract> conceptRequests) {
-        List<ConceptContract> answerConcepts = new ArrayList<>();
-        for (ConceptContract conceptRequest : conceptRequests) {
-            if (conceptRequest.getAnswers() != null) {
-                answerConcepts.addAll(conceptRequest.getAnswers().stream().filter(conceptContract -> StringUtils.hasText(conceptContract.getName())).toList());
+    private static void updateMediaInfo(ConceptContract conceptRequest, Concept concept, boolean ignoreConceptRequestMediaAbsence) {
+        if (StringUtils.hasText(conceptRequest.getMediaUrl())) {
+            concept.setMediaType(Concept.MediaType.Image);
+            concept.setMediaUrl(conceptRequest.getMediaUrl());
+        } else {
+            if (ignoreConceptRequestMediaAbsence && StringUtils.hasText(concept.getMediaUrl())) {
+                return; // Ignore if no media URL is provided, and we should not remove the existing media info
+            } else {
+                concept.setMediaType(null);
+                concept.setMediaUrl(null);
             }
         }
-        return answerConcepts;
+    }
+
+    public List<String> saveOrUpdateConcepts(List<ConceptContract> conceptRequests, ConceptContract.RequestType requestType) {
+        ArrayList<Concept> concepts = new ArrayList<>();
+        for (ConceptContract conceptRequest : conceptRequests) {
+            logger.info("Processing concept: {} {}", conceptRequest.getName(), conceptRequest.getUuid());
+            List<ConceptContract> answerConcepts = getAnswerConcepts(conceptRequest);
+            for (ConceptContract answerConceptRequest : answerConcepts) {
+                Concept answerConcept = fetchOrCreateConcept(answerConceptRequest, !requestType.equals(ConceptContract.RequestType.Bundle));
+                String dataType = getDataType(answerConceptRequest, answerConcept);
+                answerConcept.setName(answerConceptRequest.getName());
+                answerConcept.setDataType(dataType);
+                updateMediaInfo(answerConceptRequest, answerConcept, true);
+                answerConcept.updateAudit();
+                conceptRepository.save(answerConcept);
+                addToMigrationIfRequired(answerConceptRequest);
+            }
+
+            Concept concept = fetchOrCreateConcept(conceptRequest, false);
+            String dataType = getDataType(conceptRequest, concept);
+            concept.setName(conceptRequest.getName());
+            concept.setDataType(dataType);
+
+            concept.setVoided(conceptRequest.isVoided());
+            concept.setActive(conceptRequest.getActive());
+            concept.setKeyValues(conceptRequest.getKeyValues());
+            updateMediaInfo(conceptRequest, concept, false);
+            concept.updateAudit();
+
+            switch (ConceptDataType.valueOf(dataType)) {
+                case Coded:
+                    createCodedConcept(concept, conceptRequest);
+                    break;
+                case Numeric:
+                    setRangeValues(concept, conceptRequest);
+                    break;
+            }
+
+            concepts.add(conceptRepository.save(concept));
+            addToMigrationIfRequired(conceptRequest);
+        }
+        return concepts.stream()
+                .map(Concept::getUuid)
+                .collect(Collectors.toList());
+    }
+
+    private void assertNotDuplicate(ConceptContract conceptRequest) {
+        if (StringUtils.hasText(conceptRequest.getName()) && StringUtils.hasText(conceptRequest.getUuid()) && conceptExistsWithSameNameAndDifferentUUID(conceptRequest)) {
+            Concept existingConcept = conceptRepository.findByName(conceptRequest.getName().trim());
+            throw new BadRequestError(String.format("Concept with name '%s' already exists with different UUID: %s",
+                    conceptRequest.getName(), existingConcept.getUuid()));
+        }
+    }
+
+    private static List<ConceptContract> getAnswerConcepts(ConceptContract conceptRequest) {
+        if (conceptRequest.getAnswers() != null) {
+            return conceptRequest.getAnswers().stream().filter(ConceptContract::hasNameOrUUID).toList();
+        }
+        return List.of();
     }
 
     public Concept get(String uuid) {
